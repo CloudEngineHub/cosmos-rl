@@ -13,46 +13,41 @@
 # -----------------------------------------------------------------------------
 
 import logging
+
 logging.getLogger("cosmos").propagate = False
 import importlib
-import os
-import time
 
 import numpy as np
 import torch
-import torch.distributed as dist
 from transformers import AutoConfig
 
 from imaginaire.lazy_config import instantiate
+
 # from imaginaire.utils import distributed, log, misc
 from imaginaire.utils.config_helper import get_config_module, override
-from projects.cosmos3.vlm.processors import build_processor
-from projects.cosmos3.vlm.train import init_cosmos_rl_model
-from projects.cosmos3.vlm.trainer.sft_trainer_cosmos_rl import init_optimizer_scheduler
-from projects.cosmos3.vlm.utils.broadcast_databatch import broadcast_databatch
-from projects.cosmos3.vlm.utils.create_position_ids import get_position_ids
 
-        # # Instantiate i4 model
-        # config_file = "projects/cosmos3/vlm/configs/base/config.py"
-        # config_module = get_config_module(config_file)
-        # config = importlib.import_module(config_module).make_config()
-        # experiment = "pre_exp020_000_qwen3_vl_30b_a3b_thinking"
-        # config = override(
-        #     config,
-        #     [
-        #         "--",
-        #         f"experiment={experiment}",
-        #         # "data_train=09_eagle_sft_full_mul_repeat_debug_s3",
-        #         # "data_train=debug_image_data_qwen",
-        #     ],
-        # )
-        # self.dataloader = instantiate(config.dataloader_train)
+# # Instantiate i4 model
+# config_file = "projects/cosmos3/vlm/configs/base/config.py"
+# config_module = get_config_module(config_file)
+# config = importlib.import_module(config_module).make_config()
+# experiment = "pre_exp020_000_qwen3_vl_30b_a3b_thinking"
+# config = override(
+#     config,
+#     [
+#         "--",
+#         f"experiment={experiment}",
+#         # "data_train=09_eagle_sft_full_mul_repeat_debug_s3",
+#         # "data_train=debug_image_data_qwen",
+#     ],
+# )
+# self.dataloader = instantiate(config.dataloader_train)
 
 """
 Usage:
-PYTHONPATH=.:cosmos-rl torchrun --nproc_per_node=8 projects/cosmos3/vlm/scripts/compute_flop_qwen3/profile_qwen3vl.py --skip_train_loop=1 --experiment=pre_exp020_010_qwen3_vl_30b_a3b_thinking_flop3s
+cd imaginaire4
+PYTHONPATH=.:~/cosmos-rl cosmos-rl --config ~/cosmos-rl/configs/qwen3/qwen3-vl-custom.toml ~/cosmos-rl/tools/dataset/i4_vlm_sft.py
 """
-    
+
 # -----------------------------------------------------------------------------
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
 # All rights reserved.
@@ -70,26 +65,14 @@ PYTHONPATH=.:cosmos-rl torchrun --nproc_per_node=8 projects/cosmos3/vlm/scripts/
 import copy
 from typing import Any, Dict, List, Optional
 
-import torch
 from cosmos_rl.dispatcher.data.packer.base import DataPacker
 from cosmos_rl.launcher.worker_entry import main as launch_worker
 from cosmos_rl.policy.config import Config
 from cosmos_rl.policy.config import Config as CosmosConfig
 from cosmos_rl.utils.logging import logger
 from cosmos_rl.utils.util import retry
-from PIL import Image
 from torch.utils.data import Dataset
-from transformers import AutoConfig, AutoProcessor, AutoTokenizer
-
-
-from imaginaire.datasets.webdataset.dataloader import DataLoader as WebDataLoader
-from imaginaire.lazy_config import LazyCall as L
-from imaginaire.lazy_config import instantiate
-from projects.cosmos3.vlm.datasets.augmentors.nvlm_data_to_conversation import NVLMImageDataConversation
-from projects.cosmos3.vlm.datasets.augmentors.nvlm_data_unify import NVLMImageDataUnify
-from projects.cosmos3.vlm.datasets.data_sources.nvlm import get_data_key, get_data_weight_dict
-from projects.cosmos3.vlm.datasets.dataset_provider_nvlm import get_nvlm_dataset
-import multiprocessing as mp
+from transformers import AutoProcessor, AutoTokenizer
 
 
 MAX_PIXELS = 81920
@@ -109,7 +92,9 @@ class EagleVLMDataPacker(DataPacker):
             config.policy.model_name_or_path, trust_remote_code=True
         )
 
-        hf_config = retry(AutoConfig.from_pretrained)(config.policy.model_name_or_path, trust_remote_code=True)
+        hf_config = retry(AutoConfig.from_pretrained)(
+            config.policy.model_name_or_path, trust_remote_code=True
+        )
 
         image_token_id = getattr(hf_config, "image_token_id", None) or getattr(
             hf_config.vision_config, "image_token_id", None
@@ -162,10 +147,22 @@ class EagleVLMDataPacker(DataPacker):
         for i in range(n - pad_run_length + 1):
             if token_ids[i : i + pad_run_length] == target_run:
                 # splice in the replacement
-                if len(token_ids) > i + pad_run_length and token_ids[i + pad_run_length] == eos_token_id:
-                    label_ids = label_ids[:i] + replacement_ids + [eos_token_id] + label_ids[i + pad_run_length + 1 :]
+                if (
+                    len(token_ids) > i + pad_run_length
+                    and token_ids[i + pad_run_length] == eos_token_id
+                ):
+                    label_ids = (
+                        label_ids[:i]
+                        + replacement_ids
+                        + [eos_token_id]
+                        + label_ids[i + pad_run_length + 1 :]
+                    )
                 else:
-                    label_ids = label_ids[:i] + replacement_ids + label_ids[i + pad_run_length :]
+                    label_ids = (
+                        label_ids[:i]
+                        + replacement_ids
+                        + label_ids[i + pad_run_length :]
+                    )
                 return (
                     True,
                     token_ids[:i] + replacement_ids + token_ids[i + pad_run_length :],
@@ -186,8 +183,12 @@ class EagleVLMDataPacker(DataPacker):
             eos_token_id = self.tokenizer.eos_token_id
             pad_run_length = 10
             assistant_content = []
-            assert "messages" in conversation, f"messages not in conversation: {conversation}"
-            assert "images" in conversation, f"images not in conversation: {conversation}"
+            assert (
+                "messages" in conversation
+            ), f"messages not in conversation: {conversation}"
+            assert (
+                "images" in conversation
+            ), f"images not in conversation: {conversation}"
             messages = conversation["messages"]
             image_inputs = conversation["images"]
             for message in messages:
@@ -208,7 +209,9 @@ class EagleVLMDataPacker(DataPacker):
                                 assistant_content.append(item["text"])
                                 new_content[i]["text"] = pad_token * pad_run_length
                             else:
-                                raise ValueError(f"Unsupported content type: {type(item)}")
+                                raise ValueError(
+                                    f"Unsupported content type: {type(item)}"
+                                )
                     else:
                         raise ValueError(f"Unsupported content type: {type(content)}")
                     message["content"] = new_content
@@ -225,7 +228,9 @@ class EagleVLMDataPacker(DataPacker):
                                 else:
                                     continue
                             else:
-                                raise ValueError(f"Unsupported content type: {type(item)}")
+                                raise ValueError(
+                                    f"Unsupported content type: {type(item)}"
+                                )
                     message["content"] = new_content
 
             text = self.hf_processor.apply_chat_template(
@@ -251,7 +256,9 @@ class EagleVLMDataPacker(DataPacker):
             label_ids = [IGNORE_LABEL_ID] * len(input_ids)
 
             for assistant_content in assistant_content:
-                replacement_ids = self.tokenizer.encode(assistant_content, add_special_tokens=False)
+                replacement_ids = self.tokenizer.encode(
+                    assistant_content, add_special_tokens=False
+                )
 
                 replaced, input_ids, label_ids = self._replace_assistant_content(
                     input_ids,
@@ -268,7 +275,9 @@ class EagleVLMDataPacker(DataPacker):
                         f"input_ids and label_ids should have the same length, but got {len(input_ids)} and {len(label_ids)}"
                     )
         except Exception as e:
-            logger.error(f"Error processing sample: {e}, please fix to ensure SFT works")
+            logger.error(
+                f"Error processing sample: {e}, please fix to ensure SFT works"
+            )
             raise e
 
         result_dict = {
@@ -276,12 +285,18 @@ class EagleVLMDataPacker(DataPacker):
             "label_ids": label_ids,
         }
 
-        result_dict["pixel_values"] = inputs["pixel_values"] if "pixel_values" in inputs else None
-        result_dict["image_sizes"] = inputs["image_sizes"] if "image_sizes" in inputs else None
+        result_dict["pixel_values"] = (
+            inputs["pixel_values"] if "pixel_values" in inputs else None
+        )
+        result_dict["image_sizes"] = (
+            inputs["image_sizes"] if "image_sizes" in inputs else None
+        )
 
         return result_dict
 
-    def _collate_fn(self, processed_samples: List[Dict[str, Any]], computed_max_len: int) -> Dict[str, Any]:
+    def _collate_fn(
+        self, processed_samples: List[Dict[str, Any]], computed_max_len: int
+    ) -> Dict[str, Any]:
         pixel_values = [x["pixel_values"] for x in processed_samples]
         image_sizes = [x["image_sizes"] for x in processed_samples]
 
@@ -308,7 +323,8 @@ class EagleVLMDataPacker(DataPacker):
         batch["input_ids"] = torch.tensor(
             [
                 x["input_ids"][:computed_max_len]
-                + [self.tokenizer.pad_token_id] * (max(0, computed_max_len - len(x["input_ids"])))
+                + [self.tokenizer.pad_token_id]
+                * (max(0, computed_max_len - len(x["input_ids"])))
                 for x in processed_samples
             ],
             dtype=torch.long,
@@ -317,22 +333,24 @@ class EagleVLMDataPacker(DataPacker):
             batch["label_ids"] = torch.tensor(
                 [
                     x["label_ids"][:computed_max_len]
-                    + [IGNORE_LABEL_ID] * (max(0, computed_max_len - len(x["label_ids"])))
+                    + [IGNORE_LABEL_ID]
+                    * (max(0, computed_max_len - len(x["label_ids"])))
                     for x in processed_samples
                 ],
                 dtype=torch.long,
             )
         batch["logprob_masks"] = torch.tensor(
             [
-                x["logprob_masks"][:computed_max_len] + [0] * (max(0, computed_max_len - len(x["logprob_masks"])))
+                x["logprob_masks"][:computed_max_len]
+                + [0] * (max(0, computed_max_len - len(x["logprob_masks"])))
                 for x in processed_samples
             ],
             dtype=torch.bool,
         )
 
-        assert len(batch["input_ids"]) == len(batch["logprob_masks"]), (
-            "The length of input_ids, logprob_masks should be the same"
-        )
+        assert len(batch["input_ids"]) == len(
+            batch["logprob_masks"]
+        ), "The length of input_ids, logprob_masks should be the same"
 
         return batch
 
@@ -361,7 +379,9 @@ class EagleVLMDataPacker(DataPacker):
         return_dict["input_ids"] = input_ids
 
         return_dict["logprob_masks"] = (
-            [0] * (len(input_ids) - 1 + n_ignore_prefix_tokens) + [1] * (-n_ignore_prefix_tokens) + [0]
+            [0] * (len(input_ids) - 1 + n_ignore_prefix_tokens)
+            + [1] * (-n_ignore_prefix_tokens)
+            + [0]
         )
 
         return_dict["label_ids"] = x["label_ids"]
@@ -370,13 +390,17 @@ class EagleVLMDataPacker(DataPacker):
     def policy_compute_max_len(self, processed_samples: List[Dict[str, Any]]) -> int:
         return max([len(x["input_ids"]) for x in processed_samples])
 
-    def policy_collate_fn(self, processed_samples: List[Dict[str, Any]], computed_max_len: int) -> Dict[str, Any]:
+    def policy_collate_fn(
+        self, processed_samples: List[Dict[str, Any]], computed_max_len: int
+    ) -> Dict[str, Any]:
         for x in processed_samples:
             if "label_ids" in x:
                 del x["label_ids"]
         return self._collate_fn(processed_samples, computed_max_len)
 
-    def sft_process_sample(self, sample: "EagleVLMDataPacker.Payload") -> Dict[str, Any]:
+    def sft_process_sample(
+        self, sample: "EagleVLMDataPacker.Payload"
+    ) -> Dict[str, Any]:
         """
         Accepts either raw text or conversation format.
         """
@@ -386,7 +410,7 @@ class EagleVLMDataPacker(DataPacker):
         """
         Compute the maximum sequence length of the processed samples
         """
-        return processed_samples['input_ids'].shape[1]
+        return processed_samples["input_ids"].shape[1]
 
     def sft_collate_fn(
         self,
@@ -409,7 +433,7 @@ class EagleVLMDataPacker(DataPacker):
 
     def batch_size(self, batch: Dict[str, Any]) -> int:
         return batch["input_ids"].size(0)
-    
+
     def slice_batch(
         self,
         batch: Dict[str, Any],
@@ -436,14 +460,14 @@ class CustomSFTDataPacker(EagleVLMDataPacker):
         self.IGNORE_LABEL_ID = IGNORE_LABEL_ID
 
 
-class CosmosSFTDataset(Dataset):    
-    def setup(self, config: Config, tokenizer: AutoTokenizer=None, *args, **kwargs):
+class CosmosSFTDataset(Dataset):
+    def setup(self, config: Config, tokenizer: AutoTokenizer = None, *args, **kwargs):
         """
         Called by launcher after being mounted
         """
         self.config = config
         self.tokenizer = tokenizer
-        
+
         # Instantiate i4 model
         config_file = "projects/cosmos3/vlm/configs/base/config.py"
         config_module = get_config_module(config_file)
@@ -466,9 +490,8 @@ class CosmosSFTDataset(Dataset):
         return len(self.dataloader)
 
 
-
 if __name__ == "__main__":
-    # mp.set_start_method('spawn', force=True) 
+    # mp.set_start_method('spawn', force=True)
     def get_dataset(config: CosmosConfig) -> Dataset:
         return CosmosSFTDataset()
 
