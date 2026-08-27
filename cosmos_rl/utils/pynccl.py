@@ -51,35 +51,100 @@ from torch.distributed import ReduceOp
 
 
 # ---------------------------------------------------------------------------
-# NCCL ctypes binding instance (shared)
+# NCCL ctypes binding instance (shared, lazily constructed)
 # ---------------------------------------------------------------------------
+
+_NCCL_SO_ENV = "COSMOS_NCCL_SO_PATH"
+
+
+def _nccl_so_files_in(candidate_dir: str) -> list[str]:
+    """Return the libnccl.so* files in <candidate_dir>/lib, one per real file."""
+    if not candidate_dir or not os.path.isdir(candidate_dir):
+        return []
+    lib_dir = os.path.join(candidate_dir, "lib")
+    if not os.path.isdir(lib_dir):
+        return []
+    found = glob.glob(os.path.join(lib_dir, "libnccl.so*"))
+    # Dedupe by real target rather than dropping symlinks: a wheel collapses
+    # libnccl.so -> libnccl.so.2, while symlink-based install trees contain
+    # nothing but links, so excluding links would find nothing at all.
+    by_real = {os.path.realpath(f): f for f in found if os.path.exists(f)}
+    return sorted(by_real.values())
+
+
 def _find_nccl_so_file() -> str:
-    """Find the libnccl.so* shared object file from the nvidia-nccl-cu* package."""
+    """Find libnccl.so* from the nvidia-nccl-cu* package, in any layout."""
 
-    # we assume `nvidia-nccl-cu*` python package is installed next to the torch
-    # package (under site-packages directory)
+    # 0) Explicit override. Escape hatch for system NCCL or an unusual layout.
+    override = os.environ.get(_NCCL_SO_ENV)
+    if override:
+        if os.path.isfile(override):
+            return override
+        if _nccl_so_files_in(override):
+            return _nccl_so_files_in(override)[0]
+        raise RuntimeError(
+            f"{_NCCL_SO_ENV}={override!r} does not name a libnccl.so* file "
+            "or a directory containing lib/libnccl.so*"
+        )
+
+    candidates: list[str] = []
+
+    # 1) Ask Python. Correct in any layout where the wheel is importable.
+    #    nvidia.nccl is a namespace package: read __path__, not __file__.
+    try:
+        import nvidia.nccl as _nvidia_nccl
+
+        candidates.extend(list(getattr(_nvidia_nccl, "__path__", []) or []))
+    except (ImportError, AttributeError):
+        pass
+
+    # 2) Current behaviour: next to torch. Retained so nothing regresses.
     torch_dir = os.path.dirname(torch.__file__)
-    nvidia_nccl_dir = os.path.join(os.path.dirname(torch_dir), "nvidia", "nccl")
-    if not os.path.isdir(nvidia_nccl_dir):
-        raise RuntimeError(
-            f"Could not find `nvidia-nccl-cu*` package directory: {nvidia_nccl_dir}"
-            "Please install the `nvidia-nccl-cu*` package."
-        )
-    # find the so files in nvidia-nccl directory
-    so_files = glob.glob(os.path.join(nvidia_nccl_dir, "lib", "libnccl.so*"))
-    # filter out the symbolic links
-    so_files = [f for f in so_files if not os.path.islink(f)]
-    if len(so_files) != 1:
-        raise RuntimeError(
-            f"Expected exactly one libnccl.so* file in {nvidia_nccl_dir}/lib, "
-            f"but found {len(so_files)}: {so_files}. Please check your installation."
-        )
+    candidates.append(os.path.join(os.path.dirname(torch_dir), "nvidia", "nccl"))
 
-    so_file = so_files[0]
-    return so_file
+    for candidate in candidates:
+        so_files = _nccl_so_files_in(candidate)
+        if len(so_files) == 1:
+            return so_files[0]
+
+    raise RuntimeError(
+        "Could not locate libnccl.so* from the `nvidia-nccl-cu*` package.\n"
+        f"Searched: {candidates}\n"
+        f"Install the `nvidia-nccl-cu*` package, or set {_NCCL_SO_ENV} to the "
+        "libnccl.so file or to the directory containing lib/libnccl.so*."
+    )
 
 
-_nccl = NCCLLibrary(so_file=_find_nccl_so_file())
+_nccl_instance: Optional[NCCLLibrary] = None
+_nccl_lock = threading.Lock()
+
+
+def get_nccl() -> NCCLLibrary:
+    """Return the shared NCCLLibrary handle, constructing it on first use."""
+    global _nccl_instance
+    if _nccl_instance is None:
+        with _nccl_lock:
+            if _nccl_instance is None:
+                _nccl_instance = NCCLLibrary(so_file=_find_nccl_so_file())
+    return _nccl_instance
+
+
+class _LazyNCCL:
+    """Forwards attribute access to :func:`get_nccl`, constructing on first use.
+
+    A module-scope ``__getattr__`` (PEP 562) only intercepts *external*
+    lookups like ``pynccl._nccl``; bare references to ``_nccl`` inside this
+    module resolve straight from ``globals()`` and would bypass it. Binding a
+    real proxy object to the module-level ``_nccl`` name keeps both paths --
+    and ``unittest.mock.patch.object(pynccl, "_nccl", ...)`` -- consistent.
+    """
+
+    def __getattr__(self, name: str):
+        return getattr(get_nccl(), name)
+
+
+_nccl = _LazyNCCL()
+
 
 # ---------------------------------------------------------------------------
 # Communicator registry (thread-safe singleton)
